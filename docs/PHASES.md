@@ -21,8 +21,8 @@
 **Goal:** Engine math works on synthetic data; UI works on mock data. Zero blocking.
 - [x] **Dev 1 (Engine):** Implement ring buffer (15–30s sliding window), POS (Plane-Orthogonal-to-Skin) projection, 0.7–3.0 Hz bandpass filter, and 1024-pt FFT for BPM.
 - [x] **Dev 1 (Engine):** Write a quick test script feeding a synthetic 72 BPM sine wave into the worker to verify accuracy within ±1 BPM.
-- [ ] **Dev 2 (Interface):** Build `useWebcam.ts` and `useFaceMesh.ts` to extract `RoiRgbSample` (forehead + left/right cheeks + head velocity).
-- [ ] **Dev 2 (Interface):** Build the `100dvh` mobile-first Clinical HUD, 60 FPS `<canvas>` PPG waveform, and a temporary `useMockTelemetry.ts` hook.
+- [x] **Dev 2 (Interface):** Build `useWebcam.ts` and `useFaceMesh.ts` to extract `RoiRgbSample` (forehead + left/right cheeks + head velocity).
+- [x] **Dev 2 (Interface):** Build the `100dvh` mobile-first Clinical HUD, 60 FPS `<canvas>` PPG waveform, and a temporary `useMockTelemetry.ts` hook.
 - **Gate:** Dev 1 passes synthetic BPM test; Dev 2 renders a smooth 60 FPS HUD on desktop and mobile viewports.
 
 ---
