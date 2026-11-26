@@ -17,18 +17,24 @@ export interface RppgEngineOptions {
   minHrHz?: number;
   /** Heart-rate bandpass upper cutoff in Hz (default 3.0 Hz = 180 BPM). */
   maxHrHz?: number;
-  /** Minimum SQI (0–100) required to report a locked BPM (default 25). */
+  /** Minimum SQI (0–100) required to acquire initial BPM lock (default 18). */
   minLockSqi?: number;
+  /** Lower SQI hysteresis threshold to retain an existing lock (default 10). */
+  retainLockSqi?: number;
+  /** Grace window in ms to hold last stable BPM during brief webcam hiccups (default 2_500 ms). */
+  lockGraceMs?: number;
 }
 
 const DEFAULT_OPTIONS: Required<RppgEngineOptions> = {
   maxSamples: 1024,
-  windowDurationMs: 30_000,
-  minLockDurationMs: 5_000,
-  minLockSamples: 90,
+  windowDurationMs: 20_000,
+  minLockDurationMs: 6_000,
+  minLockSamples: 64,
   minHrHz: 0.7,
   maxHrHz: 3.0,
-  minLockSqi: 25,
+  minLockSqi: 18,
+  retainLockSqi: 10,
+  lockGraceMs: 2_500,
 };
 
 export const IDLE_TELEMETRY: VitalTelemetry = {
@@ -63,6 +69,9 @@ export class RppgEngine {
   private readonly ppgFiltered: Float32Array;
 
   private smoothedBpm: number | null = null;
+  private smoothedSqi = 0;
+  private lastGoodLockMs = -1;
+  private lastBpmUpdateMs = -1;
 
   constructor(options?: RppgEngineOptions) {
     this.opts = { ...DEFAULT_OPTIONS, ...options };
@@ -87,6 +96,9 @@ export class RppgEngine {
   reset(): VitalTelemetry {
     this.ringBuffer.reset();
     this.smoothedBpm = null;
+    this.smoothedSqi = 0;
+    this.lastGoodLockMs = -1;
+    this.lastBpmUpdateMs = -1;
     return { ...IDLE_TELEMETRY };
   }
 
@@ -156,37 +168,77 @@ export class RppgEngine {
       this.opts.maxHrHz
     );
 
-    if (!peak.valid || peak.sqiScore < this.opts.minLockSqi) {
+    // Smooth SQI slightly so single-frame noise jitter doesn't flicker status
+    this.smoothedSqi =
+      this.smoothedSqi === 0
+        ? peak.sqiScore
+        : 0.25 * peak.sqiScore + 0.75 * this.smoothedSqi;
+    const reportedSqi = Math.round(this.smoothedSqi);
+
+    const hasExistingLock = this.smoothedBpm !== null;
+    const meetsLockThreshold = hasExistingLock
+      ? reportedSqi >= this.opts.retainLockSqi
+      : reportedSqi >= this.opts.minLockSqi;
+
+    if (peak.valid && meetsLockThreshold) {
+      this.lastGoodLockMs = sample.timestampMs;
+
+      if (this.smoothedBpm === null) {
+        this.smoothedBpm = peak.bpm;
+      } else {
+        // Slew-rate limit (max 6 BPM/sec) + EMA to prevent single-frame harmonic jumps
+        const dtSec =
+          this.lastBpmUpdateMs >= 0
+            ? Math.max(0.01, (sample.timestampMs - this.lastBpmUpdateMs) / 1000)
+            : 0.033;
+        const maxDelta = Math.max(0.6, 6 * dtSec);
+        const clampedTarget =
+          this.smoothedBpm +
+          Math.max(-maxDelta, Math.min(maxDelta, peak.bpm - this.smoothedBpm));
+        this.smoothedBpm = 0.25 * clampedTarget + 0.75 * this.smoothedBpm;
+      }
+      this.lastBpmUpdateMs = sample.timestampMs;
+
       return {
-        status: "calibrating",
-        bpm: null,
+        status: "locked",
+        bpm: Math.round(this.smoothedBpm * 10) / 10,
         hrvRmssdMs: null,
         respiratoryRate: null,
-        sqiScore: peak.sqiScore,
+        sqiScore: reportedSqi,
         skinToneCalibrationActive: false,
         ppgWaveValue,
-        guidanceMessage: "Stabilizing pulse signal...",
+        guidanceMessage: "Signal locked — hold steady",
       };
     }
 
-    // Mild exponential smoothing to prevent jitter while tracking true HR closely
-    if (this.smoothedBpm === null) {
-      this.smoothedBpm = peak.bpm;
-    } else {
-      this.smoothedBpm = 0.35 * peak.bpm + 0.65 * this.smoothedBpm;
+    // Hysteresis grace window: hold last locked BPM during brief (< 2.5s) webcam dips
+    if (
+      this.smoothedBpm !== null &&
+      this.lastGoodLockMs >= 0 &&
+      sample.timestampMs - this.lastGoodLockMs <= this.opts.lockGraceMs
+    ) {
+      return {
+        status: "locked",
+        bpm: Math.round(this.smoothedBpm * 10) / 10,
+        hrvRmssdMs: null,
+        respiratoryRate: null,
+        sqiScore: reportedSqi,
+        skinToneCalibrationActive: false,
+        ppgWaveValue,
+        guidanceMessage: "Signal locked — hold steady",
+      };
     }
 
-    const roundedBpm = Math.round(this.smoothedBpm * 10) / 10;
-
+    this.smoothedBpm = null;
     return {
-      status: "locked",
-      bpm: roundedBpm,
+      status: "calibrating",
+      bpm: null,
       hrvRmssdMs: null,
       respiratoryRate: null,
-      sqiScore: peak.sqiScore,
+      sqiScore: reportedSqi,
       skinToneCalibrationActive: false,
       ppgWaveValue,
-      guidanceMessage: "Signal locked",
+      guidanceMessage: "Stabilizing pulse signal — face light & hold still",
     };
   }
 

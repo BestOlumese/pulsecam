@@ -29,9 +29,9 @@
 
 ## Phase 2: Live rPPG Integration (Days 4–5 — Nov 29–30)
 **Goal:** Replace mock telemetry with real webcam-to-worker heart rate.
-- [ ] **Both:** Connect `useFaceMesh.ts` output (`RoiRgbSample`) to `rppg.worker.ts` via `postMessage`.
-- [ ] **Both:** Verify live PPG waveform and BPM lock on a real face within 10–15 seconds.
-- [ ] **Dev 2:** Add face-alignment reticle and ROI debug toggle (great for the demo video).
+- [x] **Both:** Connect `useFaceMesh.ts` output (`RoiRgbSample`) to `rppg.worker.ts` via `postMessage`.
+- [x] **Both:** Verify live PPG waveform and BPM lock on a real face within 10–15 seconds.
+- [x] **Dev 2:** Add face-alignment reticle and ROI debug toggle (great for the demo video).
 - **Gate:** Real webcam produces a stable BPM reading with DevTools Network tab showing 0 bytes uploaded.
 
 ---

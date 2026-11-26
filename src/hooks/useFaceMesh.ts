@@ -20,9 +20,13 @@ export interface FaceRoiBoxes {
 
 export type FaceMeshStatus = "idle" | "loading" | "ready" | "error";
 
+export type FaceAlignmentState = "none" | "aligned" | "move_closer" | "off_center";
+
 export interface UseFaceMeshOptions {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   enabled: boolean;
+  /** When true, exposes throttled live `debugSample` RGB stats for the ROI debug HUD. */
+  debugEnabled?: boolean;
   onSample?: (sample: RoiRgbSample) => void;
 }
 
@@ -30,7 +34,9 @@ export interface UseFaceMeshResult {
   modelStatus: FaceMeshStatus;
   modelError: string | null;
   faceDetected: boolean;
+  faceAlignment: FaceAlignmentState;
   roiBoxes: FaceRoiBoxes | null;
+  debugSample: RoiRgbSample | null;
   latestSampleRef: React.RefObject<RoiRgbSample | null>;
 }
 
@@ -164,6 +170,18 @@ function extractMeanRgbFromBox(
   return [rSum / pixelCount, gSum / pixelCount, bSum / pixelCount];
 }
 
+function classifyFaceAlignment(bounds: NormalizedBox): FaceAlignmentState {
+  if (bounds.height < 0.24 || bounds.width < 0.16) {
+    return "move_closer";
+  }
+  const cx = bounds.x + bounds.width * 0.5;
+  const cy = bounds.y + bounds.height * 0.5;
+  if (Math.abs(cx - 0.5) > 0.22 || Math.abs(cy - 0.5) > 0.22) {
+    return "off_center";
+  }
+  return "aligned";
+}
+
 /**
  * Client-side MediaPipe FaceLandmarker hook that extracts per-frame forehead,
  * left cheek, and right cheek RGB means plus scale-invariant head velocity
@@ -172,20 +190,28 @@ function extractMeanRgbFromBox(
 export function useFaceMesh({
   videoRef,
   enabled,
+  debugEnabled = false,
   onSample,
 }: UseFaceMeshOptions): UseFaceMeshResult {
   const [modelStatus, setModelStatus] = useState<FaceMeshStatus>("idle");
   const [modelError, setModelError] = useState<string | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
+  const [faceAlignment, setFaceAlignment] = useState<FaceAlignmentState>("none");
   const [roiBoxes, setRoiBoxes] = useState<FaceRoiBoxes | null>(null);
+  const [debugSample, setDebugSample] = useState<RoiRgbSample | null>(null);
 
   const landmarkerRef = useRef<FaceLandmarker | null>(null);
   const latestSampleRef = useRef<RoiRgbSample | null>(null);
   const onSampleRef = useRef(onSample);
+  const debugEnabledRef = useRef(debugEnabled);
 
   useEffect(() => {
     onSampleRef.current = onSample;
   }, [onSample]);
+
+  useEffect(() => {
+    debugEnabledRef.current = debugEnabled;
+  }, [debugEnabled]);
 
   const prevAnchorRef = useRef<{ x: number; y: number; ts: number } | null>(null);
   const lastVideoTimeRef = useRef<number>(-1);
@@ -376,19 +402,27 @@ export function useFaceMesh({
           if (nowMs - lastUiSyncRef.current > 66) {
             lastUiSyncRef.current = nowMs;
             setFaceDetected(true);
+            setFaceAlignment(classifyFaceAlignment(faceBounds));
             setRoiBoxes({
               forehead: foreheadBox,
               leftCheek: leftCheekBox,
               rightCheek: rightCheekBox,
               faceBounds,
             });
+            if (debugEnabledRef.current) {
+              setDebugSample(sample);
+            }
           }
         } else {
           prevAnchorRef.current = null;
           if (nowMs - lastUiSyncRef.current > 120) {
             lastUiSyncRef.current = nowMs;
             setFaceDetected(false);
+            setFaceAlignment("none");
             setRoiBoxes(null);
+            if (debugEnabledRef.current) {
+              setDebugSample(null);
+            }
           }
         }
       }
@@ -404,7 +438,9 @@ export function useFaceMesh({
     modelStatus,
     modelError,
     faceDetected: isTrackingActive ? faceDetected : false,
+    faceAlignment: isTrackingActive ? faceAlignment : "none",
     roiBoxes: isTrackingActive ? roiBoxes : null,
+    debugSample: isTrackingActive && debugEnabled ? debugSample : null,
     latestSampleRef,
   };
 }

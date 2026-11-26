@@ -4,10 +4,7 @@ import { useCallback, useState } from "react";
 import { Activity, Eye, EyeOff, Play, Square } from "lucide-react";
 import { useWebcam } from "@/hooks/useWebcam";
 import { useFaceMesh } from "@/hooks/useFaceMesh";
-import {
-  useMockTelemetry,
-  type MockOverrideMode,
-} from "@/hooks/useMockTelemetry";
+import { useRppgWorker } from "@/hooks/useRppgWorker";
 import { PpgWaveformCanvas } from "@/components/PpgWaveformCanvas";
 import { ViewfinderPanel } from "@/components/ViewfinderPanel";
 import { VitalMetricCard } from "@/components/VitalMetricCard";
@@ -22,7 +19,7 @@ interface FrozenVitals {
 }
 
 /**
- * Primary PulseCam Biometric Scanner HUD.
+ * Primary PulseCam Biometric Scanner HUD (Phase 2 — Live rPPG Worker Integration).
  * Strictly locked to `100dvh` with zero vertical page scrolling:
  * - Mobile (< lg): Top 55% live viewfinder + bottom 45% pinned telemetry sheet.
  * - Desktop (lg+): Left 60% viewfinder + 60 FPS PPG waveform; Right 40% vitals cockpit.
@@ -36,22 +33,26 @@ export function ClinicalHud() {
     respiratoryRate: null,
   });
 
-  const faceMesh = useFaceMesh({
-    videoRef: webcam.videoRef,
-    enabled: webcam.isActive,
-  });
-
   const {
     telemetry,
     ppgWaveRef,
     isScanning,
+    scanCompleted,
     remainingSeconds,
     scanProgress,
-    overrideMode,
-    setOverrideMode,
+    sampleRateHz,
+    workerError,
+    pushSample,
     startScan,
     stopScan,
-  } = useMockTelemetry();
+  } = useRppgWorker();
+
+  const faceMesh = useFaceMesh({
+    videoRef: webcam.videoRef,
+    enabled: webcam.isActive,
+    debugEnabled: showRoiOverlay,
+    onSample: pushSample,
+  });
 
   // Preserve last valid locked readings so warning states display frozen metrics
   const [prevTelemetry, setPrevTelemetry] = useState(telemetry);
@@ -84,16 +85,17 @@ export function ClinicalHud() {
   }, [isScanning, startScan, stopScan, webcam]);
 
   const sqiVariant =
-    telemetry.sqiScore >= 70
+    telemetry.sqiScore >= 65
       ? "good"
-      : telemetry.sqiScore >= 30 || telemetry.status === "calibrating"
+      : telemetry.sqiScore >= 25 || telemetry.status === "calibrating"
         ? "warn"
         : telemetry.status === "motion_detected" || telemetry.status === "low_light"
           ? "warn"
           : "muted";
 
-  const statusLabel =
-    telemetry.status === "locked"
+  const statusLabel = scanCompleted
+    ? "COMPLETE"
+    : telemetry.status === "locked"
       ? "LOCKED"
       : telemetry.status === "calibrating"
         ? "CALIBRATING"
@@ -102,6 +104,31 @@ export function ClinicalHud() {
           : telemetry.status === "low_light"
             ? "LOW LIGHT"
             : "IDLE";
+
+  // Contextual viewfinder guidance prioritizing sensor/alignment errors before worker prompt
+  const effectiveGuidance =
+    workerError ??
+    faceMesh.modelError ??
+    (isScanning && webcam.isActive && faceMesh.modelStatus === "loading"
+      ? "Loading on-device FaceMesh model..."
+      : isScanning && webcam.isActive && !faceMesh.faceDetected
+        ? "Center your face inside the alignment reticle"
+        : faceMesh.faceAlignment === "move_closer"
+          ? "Move slightly closer to the camera"
+          : faceMesh.faceAlignment === "off_center"
+            ? "Center face inside the reticle"
+            : telemetry.guidanceMessage);
+
+  const alignmentText =
+    faceMesh.faceAlignment === "aligned"
+      ? "Aligned"
+      : faceMesh.faceAlignment === "move_closer"
+        ? "Move closer"
+        : faceMesh.faceAlignment === "off_center"
+          ? "Off center"
+          : webcam.isActive
+            ? "No face"
+            : "Standby";
 
   return (
     <main className="flex h-dvh w-full flex-col overflow-hidden bg-background text-foreground lg:grid lg:grid-cols-12">
@@ -114,10 +141,13 @@ export function ClinicalHud() {
           onEnableCamera={() => void webcam.startWebcam()}
           faceMeshStatus={faceMesh.modelStatus}
           faceDetected={faceMesh.faceDetected}
+          faceAlignment={faceMesh.faceAlignment}
           roiBoxes={faceMesh.roiBoxes}
+          debugSample={faceMesh.debugSample}
+          sampleRateHz={sampleRateHz}
           showRoiOverlay={showRoiOverlay}
           status={telemetry.status}
-          guidanceMessage={telemetry.guidanceMessage}
+          guidanceMessage={effectiveGuidance}
           className="min-h-0 flex-1"
         />
 
@@ -133,15 +163,24 @@ export function ClinicalHud() {
 
       {/* RIGHT / BOTTOM: Pinned Telemetry Sheet (Mobile 45%) / Cockpit (Desktop 40%) */}
       <aside className="flex h-[45%] w-full flex-col justify-between bg-card px-4 py-3 lg:col-span-5 lg:h-full lg:p-6">
-        {/* Header Row: Instrument title + SQI Pill + ROI toggle */}
+        {/* Header Row: Instrument title + Live pill + SQI Pill + ROI Debug toggle */}
         <header className="flex items-center justify-between gap-2 border-b border-border pb-2.5 lg:pb-4">
           <div className="flex items-center gap-2">
             <Activity className="h-4 w-4 text-pulse-accent" />
             <h1 className="text-xs font-semibold tracking-wider uppercase text-foreground lg:text-sm">
               PulseCam
             </h1>
-            <Badge variant="muted" className="hidden font-mono text-[10px] sm:inline-flex">
-              MOCK TELEMETRY
+            <Badge
+              variant={
+                telemetry.status === "locked"
+                  ? "good"
+                  : isScanning
+                    ? "warn"
+                    : "muted"
+              }
+              className="hidden font-mono text-[10px] sm:inline-flex"
+            >
+              LIVE rPPG
             </Badge>
           </div>
 
@@ -163,17 +202,23 @@ export function ClinicalHud() {
             <Button
               type="button"
               variant="outline"
-              size="icon-xs"
+              size="xs"
               onClick={() => setShowRoiOverlay((v) => !v)}
-              aria-label={showRoiOverlay ? "Hide ROI overlay" : "Show ROI overlay"}
-              title={showRoiOverlay ? "Hide ROI overlay" : "Show ROI overlay"}
-              className="border-border bg-background text-muted-foreground hover:text-foreground"
+              aria-pressed={showRoiOverlay}
+              title="Toggle ROI debug overlay"
+              className={cn(
+                "font-mono text-[10px]",
+                showRoiOverlay
+                  ? "border-signal-good/50 bg-signal-good/10 text-signal-good hover:bg-signal-good/20"
+                  : "border-border bg-background text-muted-foreground hover:text-foreground"
+              )}
             >
               {showRoiOverlay ? (
-                <Eye className="h-3.5 w-3.5" />
+                <Eye className="h-3 w-3" />
               ) : (
-                <EyeOff className="h-3.5 w-3.5" />
+                <EyeOff className="h-3 w-3" />
               )}
+              <span>ROI</span>
             </Button>
           </div>
         </header>
@@ -216,8 +261,8 @@ export function ClinicalHud() {
             decimals={1}
           />
 
-          {/* Desktop Calibration & Diagnostic Telemetry Row */}
-          <div className="hidden rounded-lg border border-border bg-background p-3 lg:col-span-2 lg:flex lg:flex-col lg:gap-2.5">
+          {/* Desktop Live Signal Telemetry Panel */}
+          <div className="hidden rounded-lg border border-border bg-background p-3 lg:col-span-2 lg:flex lg:flex-col lg:gap-2">
             <div className="flex items-center justify-between text-xs">
               <span className="text-muted-foreground">Signal State</span>
               <span className="font-mono font-medium tabular-nums text-foreground">
@@ -225,43 +270,36 @@ export function ClinicalHud() {
               </span>
             </div>
             <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground">Scan Window</span>
-              <span className="font-mono tabular-nums text-foreground">
-                {isScanning ? `${remainingSeconds}s remaining` : "30s ready"}
+              <span className="text-muted-foreground">Face Alignment</span>
+              <span
+                className={cn(
+                  "font-mono tabular-nums",
+                  faceMesh.faceAlignment === "aligned"
+                    ? "text-signal-good"
+                    : faceMesh.faceAlignment === "none"
+                      ? "text-muted-foreground"
+                      : "text-signal-warn"
+                )}
+              >
+                {alignmentText}
               </span>
             </div>
-
-            {/* Phase 1 Mock State Preview Toggle (active during scan) */}
-            {isScanning && (
-              <div className="flex items-center justify-between border-t border-border pt-2">
-                <span className="font-mono text-[10px] tracking-wider uppercase text-muted-foreground">
-                  State Preview
-                </span>
-                <div className="flex items-center gap-1">
-                  {(
-                    [
-                      ["auto", "Live"],
-                      ["motion_detected", "Motion"],
-                      ["low_light", "Low Light"],
-                    ] as [MockOverrideMode, string][]
-                  ).map(([mode, label]) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      onClick={() => setOverrideMode(mode)}
-                      className={cn(
-                        "rounded border px-2 py-0.5 font-mono text-[10px] transition-colors",
-                        overrideMode === mode
-                          ? "border-foreground bg-foreground text-background"
-                          : "border-border bg-card text-muted-foreground hover:text-foreground"
-                      )}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">Worker Throughput</span>
+              <span className="font-mono tabular-nums text-foreground">
+                {sampleRateHz > 0 ? `${sampleRateHz} Hz` : "-- Hz"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">Scan Window</span>
+              <span className="font-mono tabular-nums text-foreground">
+                {isScanning
+                  ? `${remainingSeconds}s remaining`
+                  : scanCompleted
+                    ? "30s complete"
+                    : "30s ready"}
+              </span>
+            </div>
           </div>
         </div>
 
@@ -302,7 +340,7 @@ export function ClinicalHud() {
             ) : (
               <>
                 <Play className="h-3.5 w-3.5 fill-current" />
-                <span>Start 30s Scan</span>
+                <span>{scanCompleted ? "Start New 30s Scan" : "Start 30s Scan"}</span>
               </>
             )}
           </Button>

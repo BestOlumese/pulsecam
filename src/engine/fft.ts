@@ -153,6 +153,28 @@ export class Fft1024 {
       return res;
     }
 
+    // Harmonic alias guard: if dominant peak is > 105 BPM (1.75 Hz) and a strong
+    // sub-harmonic peak exists at half-frequency (within HR band), prefer the fundamental.
+    if (peakBin * binHz > 1.75) {
+      const halfBin = Math.round(peakBin * 0.5);
+      if (halfBin >= minBin && halfBin <= maxBin) {
+        let bestSubBin = halfBin;
+        let bestSubMag = 0;
+        const searchLo = Math.max(minBin, halfBin - 2);
+        const searchHi = Math.min(maxBin, halfBin + 2);
+        for (let k = searchLo; k <= searchHi; k++) {
+          if (mags[k] > bestSubMag) {
+            bestSubMag = mags[k];
+            bestSubBin = k;
+          }
+        }
+        if (bestSubMag >= peakMag * 0.55) {
+          peakBin = bestSubBin;
+          peakMag = bestSubMag;
+        }
+      }
+    }
+
     // Log-magnitude 3-point parabolic interpolation around peakBin
     let delta = 0;
     if (peakBin > minBin && peakBin < maxBin) {
@@ -173,21 +195,36 @@ export class Fft1024 {
     const peakHz = (peakBin + delta) * binHz;
     const bpm = peakHz * 60;
 
-    // Spectral SNR: power within ±0.15 Hz of peak vs remaining HR band
-    const peakHalfWidthBins = Math.max(1, Math.round(0.15 / binHz));
-    const sigLo = Math.max(minBin, peakBin - peakHalfWidthBins);
-    const sigHi = Math.min(maxBin, peakBin + peakHalfWidthBins);
+    // de Haan & Jeanne (2013) rPPG SNR: count fundamental (±0.15 Hz) AND
+    // 2nd cardiac harmonic (2*f ± 0.18 Hz) as signal power vs remaining HR-band noise.
+    const fundHalfBins = Math.max(1, Math.round(0.15 / binHz));
+    const sigLo1 = Math.max(minBin, peakBin - fundHalfBins);
+    const sigHi1 = Math.min(maxBin, peakBin + fundHalfBins);
+
+    const harmBin = Math.round((peakHz * 2) / binHz);
+    const harmHalfBins = Math.max(1, Math.round(0.18 / binHz));
+    const hasHarmonic = harmBin >= minBin && harmBin <= maxBin;
+    const sigLo2 = hasHarmonic ? Math.max(sigHi1 + 1, harmBin - harmHalfBins) : 1;
+    const sigHi2 = hasHarmonic ? Math.min(maxBin, harmBin + harmHalfBins) : 0;
+
     let signalPower = 0;
-    for (let k = sigLo; k <= sigHi; k++) {
+    for (let k = sigLo1; k <= sigHi1; k++) {
       const m = mags[k];
       signalPower += m * m;
     }
+    if (hasHarmonic && sigLo2 <= sigHi2) {
+      for (let k = sigLo2; k <= sigHi2; k++) {
+        const m = mags[k];
+        signalPower += m * m;
+      }
+    }
+
     const noisePower = Math.max(totalBandPower - signalPower, 1e-12);
     const snrDb = 10 * Math.log10(signalPower / noisePower);
 
-    // Map SNR (-5 dB .. +10 dB) cleanly onto 0 .. 100 SQI scale
+    // Map real-world laptop webcam rPPG SNR (-7 dB .. +6 dB) cleanly onto 0 .. 100 SQI
     const sqiScore = Math.round(
-      Math.max(0, Math.min(100, ((snrDb + 5) / 15) * 100))
+      Math.max(0, Math.min(100, ((snrDb + 7) / 13) * 100))
     );
 
     res.peakHz = peakHz;
