@@ -100,8 +100,10 @@ export class RgbRingBuffer {
   }
 
   /**
-   * Copies up to `maxWindowMs` of the most recent chronological samples into pre-allocated
-   * target buffers. Updates `lastSampleRateHz` and `lastWindowDurationMs` without allocating.
+   * Copies up to `maxWindowMs` of the most recent chronological samples resampled
+   * onto a uniform time grid via linear interpolation. Eliminates spectral smearing
+   * caused by real-world webcam / MediaPipe frame-interval jitter.
+   * Updates `lastSampleRateHz` and `lastWindowDurationMs` without allocating.
    */
   copySlidingWindow(
     maxWindowMs: number,
@@ -121,32 +123,59 @@ export class RgbRingBuffer {
     const maxCopy = Math.min(this.count, outR.length, outG.length, outB.length);
 
     // Walk backward from newest to find the start of the time window
-    let windowLen = 1;
-    while (windowLen < maxCopy) {
-      const idx = (newestIdx - windowLen + cap) % cap;
+    let rawLen = 1;
+    while (rawLen < maxCopy) {
+      const idx = (newestIdx - rawLen + cap) % cap;
       if (this.timestamps[idx] < cutoffTs) {
         break;
       }
-      windowLen += 1;
+      rawLen += 1;
     }
 
-    const oldestIdx = (newestIdx - (windowLen - 1) + cap) % cap;
+    const oldestIdx = (newestIdx - (rawLen - 1) + cap) % cap;
     const oldestTs = this.timestamps[oldestIdx];
     const durationMs = newestTs - oldestTs;
     this.lastWindowDurationMs = durationMs > 0 ? durationMs : 0;
 
-    if (windowLen >= 2 && durationMs > 0) {
-      const estimatedHz = ((windowLen - 1) * 1000) / durationMs;
-      this.lastSampleRateHz = Math.min(120, Math.max(5, estimatedHz));
+    if (rawLen < 2 || durationMs <= 0) {
+      outR[0] = this.rBuf[oldestIdx];
+      outG[0] = this.gBuf[oldestIdx];
+      outB[0] = this.bBuf[oldestIdx];
+      return 1;
     }
 
-    for (let i = 0; i < windowLen; i++) {
-      const srcIdx = (oldestIdx + i) % cap;
-      outR[i] = this.rBuf[srcIdx];
-      outG[i] = this.gBuf[srcIdx];
-      outB[i] = this.bBuf[srcIdx];
+    const rawHz = ((rawLen - 1) * 1000) / durationMs;
+    const clampedHz = Math.min(120, Math.max(5, rawHz));
+    this.lastSampleRateHz = clampedHz;
+
+    // Resample onto an exact uniform grid spanning [oldestTs, newestTs] with `rawLen` points
+    const dtMs = durationMs / (rawLen - 1);
+    let cursor = 0; // Index within [0 .. rawLen - 2]
+
+    for (let i = 0; i < rawLen; i++) {
+      const targetTs = oldestTs + i * dtMs;
+
+      while (cursor < rawLen - 2) {
+        const nextRingIdx = (oldestIdx + cursor + 1) % cap;
+        if (this.timestamps[nextRingIdx] >= targetTs) {
+          break;
+        }
+        cursor += 1;
+      }
+
+      const idx0 = (oldestIdx + cursor) % cap;
+      const idx1 = (oldestIdx + cursor + 1) % cap;
+      const t0 = this.timestamps[idx0];
+      const t1 = this.timestamps[idx1];
+      const span = t1 - t0;
+      const frac =
+        span > 1e-6 ? Math.max(0, Math.min(1, (targetTs - t0) / span)) : 0;
+
+      outR[i] = this.rBuf[idx0] + (this.rBuf[idx1] - this.rBuf[idx0]) * frac;
+      outG[i] = this.gBuf[idx0] + (this.gBuf[idx1] - this.gBuf[idx0]) * frac;
+      outB[i] = this.bBuf[idx0] + (this.bBuf[idx1] - this.bBuf[idx0]) * frac;
     }
 
-    return windowLen;
+    return rawLen;
   }
 }
