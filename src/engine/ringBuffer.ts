@@ -1,0 +1,152 @@
+import type { RoiRgbSample } from "../types/telemetry";
+
+const FOREHEAD_WEIGHT = 0.4;
+const LEFT_CHEEK_WEIGHT = 0.3;
+const RIGHT_CHEEK_WEIGHT = 0.3;
+
+/**
+ * Spatial fusion of forehead and cheek RGB means into a single 3-element output buffer.
+ * Gracefully skips any zeroed/unavailable ROI so missing landmarks do not distort luminance.
+ */
+export function fuseRoiRgb(sample: RoiRgbSample, outRgb: Float32Array): boolean {
+  const f = sample.forehead;
+  const l = sample.leftCheek;
+  const r = sample.rightCheek;
+
+  let wSum = 0;
+  let rAcc = 0;
+  let gAcc = 0;
+  let bAcc = 0;
+
+  if (f[0] + f[1] + f[2] > 0) {
+    wSum += FOREHEAD_WEIGHT;
+    rAcc += f[0] * FOREHEAD_WEIGHT;
+    gAcc += f[1] * FOREHEAD_WEIGHT;
+    bAcc += f[2] * FOREHEAD_WEIGHT;
+  }
+  if (l[0] + l[1] + l[2] > 0) {
+    wSum += LEFT_CHEEK_WEIGHT;
+    rAcc += l[0] * LEFT_CHEEK_WEIGHT;
+    gAcc += l[1] * LEFT_CHEEK_WEIGHT;
+    bAcc += l[2] * LEFT_CHEEK_WEIGHT;
+  }
+  if (r[0] + r[1] + r[2] > 0) {
+    wSum += RIGHT_CHEEK_WEIGHT;
+    rAcc += r[0] * RIGHT_CHEEK_WEIGHT;
+    gAcc += r[1] * RIGHT_CHEEK_WEIGHT;
+    bAcc += r[2] * RIGHT_CHEEK_WEIGHT;
+  }
+
+  if (wSum <= 0) {
+    outRgb[0] = 0;
+    outRgb[1] = 0;
+    outRgb[2] = 0;
+    return false;
+  }
+
+  const invW = 1 / wSum;
+  outRgb[0] = rAcc * invW;
+  outRgb[1] = gAcc * invW;
+  outRgb[2] = bAcc * invW;
+  return true;
+}
+
+/**
+ * Fixed-capacity circular buffer storing timestamped RGB means with zero per-frame allocation.
+ * Uses Float64Array for timestamps so millisecond precision is preserved for epoch or high-res clocks.
+ */
+export class RgbRingBuffer {
+  readonly capacity: number;
+  private readonly timestamps: Float64Array;
+  private readonly rBuf: Float32Array;
+  private readonly gBuf: Float32Array;
+  private readonly bBuf: Float32Array;
+
+  private writeIndex = 0;
+  private count = 0;
+
+  lastSampleRateHz = 30;
+  lastWindowDurationMs = 0;
+
+  constructor(capacity = 900) {
+    this.capacity = capacity;
+    this.timestamps = new Float64Array(capacity);
+    this.rBuf = new Float32Array(capacity);
+    this.gBuf = new Float32Array(capacity);
+    this.bBuf = new Float32Array(capacity);
+  }
+
+  get length(): number {
+    return this.count;
+  }
+
+  reset(): void {
+    this.writeIndex = 0;
+    this.count = 0;
+    this.lastSampleRateHz = 30;
+    this.lastWindowDurationMs = 0;
+  }
+
+  push(timestampMs: number, r: number, g: number, b: number): void {
+    this.timestamps[this.writeIndex] = timestampMs;
+    this.rBuf[this.writeIndex] = r;
+    this.gBuf[this.writeIndex] = g;
+    this.bBuf[this.writeIndex] = b;
+
+    this.writeIndex = (this.writeIndex + 1) % this.capacity;
+    if (this.count < this.capacity) {
+      this.count += 1;
+    }
+  }
+
+  /**
+   * Copies up to `maxWindowMs` of the most recent chronological samples into pre-allocated
+   * target buffers. Updates `lastSampleRateHz` and `lastWindowDurationMs` without allocating.
+   */
+  copySlidingWindow(
+    maxWindowMs: number,
+    outR: Float32Array,
+    outG: Float32Array,
+    outB: Float32Array
+  ): number {
+    if (this.count === 0) {
+      this.lastWindowDurationMs = 0;
+      return 0;
+    }
+
+    const cap = this.capacity;
+    const newestIdx = (this.writeIndex - 1 + cap) % cap;
+    const newestTs = this.timestamps[newestIdx];
+    const cutoffTs = newestTs - maxWindowMs;
+    const maxCopy = Math.min(this.count, outR.length, outG.length, outB.length);
+
+    // Walk backward from newest to find the start of the time window
+    let windowLen = 1;
+    while (windowLen < maxCopy) {
+      const idx = (newestIdx - windowLen + cap) % cap;
+      if (this.timestamps[idx] < cutoffTs) {
+        break;
+      }
+      windowLen += 1;
+    }
+
+    const oldestIdx = (newestIdx - (windowLen - 1) + cap) % cap;
+    const oldestTs = this.timestamps[oldestIdx];
+    const durationMs = newestTs - oldestTs;
+    this.lastWindowDurationMs = durationMs > 0 ? durationMs : 0;
+
+    if (windowLen >= 2 && durationMs > 0) {
+      const estimatedHz = ((windowLen - 1) * 1000) / durationMs;
+      this.lastSampleRateHz = Math.min(120, Math.max(5, estimatedHz));
+    }
+
+    for (let i = 0; i < windowLen; i++) {
+      const srcIdx = (oldestIdx + i) % cap;
+      outR[i] = this.rBuf[srcIdx];
+      outG[i] = this.gBuf[srcIdx];
+      outB[i] = this.bBuf[srcIdx];
+    }
+
+    return windowLen;
+  }
+}
